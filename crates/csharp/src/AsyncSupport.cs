@@ -101,6 +101,17 @@ public static class AsyncSupport
         Interop.WaitableJoin(handle, 0);
     }
 
+    // A synchronous cancel traps while the waitable is in a waitable set, and a cancelled operation
+    // delivers no event, so stop tracking it and take it out of its set first.
+    internal static void RemoveFromWaitableSet(int waitableHandle)
+    {
+        foreach (var waitables in pendingTasks.Values)
+        {
+            waitables.TryRemove(waitableHandle, out _);
+        }
+        Interop.WaitableJoin(waitableHandle, 0);
+    }
+
     private static void AddTaskToWaitables(int waitableSetHandle, int waitableHandle, WaitableInfoState waitableInfoState)
     {
         var waitableSetOfTasks = pendingTasks.GetOrAdd(waitableSetHandle, _ => new ConcurrentDictionary<int, WaitableInfoState>());
@@ -325,7 +336,8 @@ public class CancelableRead(IVTable cancelableVTable, int handle) : ICancelable
 {
     public uint Cancel()
     {
-        return cancelableVTable.CancelRead(handle);        
+        AsyncSupport.RemoveFromWaitableSet(handle);
+        return cancelableVTable.CancelRead(handle);
     }
 }
 
@@ -333,7 +345,8 @@ public class CancelableWrite(IVTable cancelableVTable, int handle) : ICancelable
 {
     public uint Cancel()
     {
-        return cancelableVTable.CancelWrite(handle);        
+        AsyncSupport.RemoveFromWaitableSet(handle);
+        return cancelableVTable.CancelWrite(handle);
     }
 }
 
@@ -1052,9 +1065,23 @@ public abstract class ComponentTask
             throw new InvalidOperationException("Cannot cancel a task that was created as completed with a result.");
         }
 
-        uint cancelReturn = cancelableVTable.Cancel();
-        SetCanceled();
-        return (CancelCode)cancelReturn;
+        // The result packs the number of values transferred above the state, like a read or write.
+        uint status = cancelableVTable.Cancel();
+        canCancel = false;
+        var code = (CancelCode)(status & 0xF);
+        if (!IsCompleted)
+        {
+            // The operation can finish before the cancel reaches it; it then completes normally.
+            if (code == CancelCode.Completed && this is ComponentTask<int> counted)
+            {
+                counted.SetResult((int)(status >> 4));
+            }
+            else
+            {
+                SetCanceled();
+            }
+        }
+        return code;
     }
 
     public abstract void SetCanceled();
